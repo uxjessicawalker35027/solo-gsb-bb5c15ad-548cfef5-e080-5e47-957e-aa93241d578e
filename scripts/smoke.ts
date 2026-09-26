@@ -41,6 +41,14 @@ import {
   SESSION_SCHEMA_VERSION,
   validateSession
 } from '../src/lib/session';
+import {
+  buildRefDiff,
+  MAX_PAIR_CELLS,
+  normalizeCueText,
+  pairDeviated,
+  refItemKey,
+  summarizeRefDiff
+} from '../src/lib/refdiff';
 
 let fail = 0;
 function assert(cond: boolean, msg: string) {
@@ -558,5 +566,154 @@ badSelected.view = { ...(badSelected.view as object), selectedId: 'ghost' };
 assert(validateSession(badSelected).ok === false, '选中字幕不属于会话拒绝');
 const nullAudio = makeValidSession({ audio: null });
 assert(validateSession(nullAudio).ok, '无音频指纹的会话合法');
+
+/* ---------------- 参考字幕差异审阅：单调配对 ---------------- */
+
+// 22. 文本归一化：NFKC + 去空白与标点
+{
+  assert(normalizeCueText('你好， 世界！') === '你好世界', '去标点与空白');
+  assert(normalizeCueText('  Hello,\nWorld! ') === 'HelloWorld', '多行空白与标点');
+  assert(normalizeCueText('ＡＢＣ．１２３') === 'ABC123', 'NFKC 折叠全角字符');
+  assert(normalizeCueText('…') === '', '纯标点归一化为空串');
+}
+
+// 23. 重复台词：最大化配对数，再最小化起点时间差总和
+{
+  // 当前 A@0 B@10 A@20；参考 A@5 A@15 B@25
+  const cur = [
+    { id: 'c1', start: 0, end: 1, text: 'A' },
+    { id: 'c2', start: 10, end: 11, text: 'B' },
+    { id: 'c3', start: 20, end: 21, text: 'A' }
+  ];
+  const ref = [
+    { id: 'r1', start: 5, end: 6, text: 'A' },
+    { id: 'r2', start: 15, end: 16, text: 'A' },
+    { id: 'r3', start: 25, end: 26, text: 'B' }
+  ];
+  const diff = buildRefDiff(cur, ref)!;
+  // LCS 长度 2；候选方案：(c1↔r1,c2↔r3) 代价 5+15=20，(c1↔r1,c3↔r2) 代价 5+5=10
+  assert(diff.pairs.length === 2, `最大化配对数 2（实际 ${diff.pairs.length}）`);
+  assert(
+    diff.pairs[0].current.id === 'c1' && diff.pairs[0].reference.id === 'r1',
+    '首对 c1↔r1'
+  );
+  assert(
+    diff.pairs[1].current.id === 'c3' && diff.pairs[1].reference.id === 'r2',
+    '次对 c3↔r2：在并列配对数中取起点差总和最小'
+  );
+  assert(diff.currentOnly.map((c) => c.id).join('') === 'c2', '当前独有 c2');
+  assert(diff.referenceOnly.map((c) => c.id).join('') === 'r3', '参考独有 r3');
+}
+
+// 24. 单侧插入不造成后续错位；去空白标点后文本相同即可配对
+{
+  const cur = [
+    { id: 'c1', start: 0, end: 1, text: '你好，世界' },
+    { id: 'c2', start: 2, end: 3, text: '单侧插入的一句' },
+    { id: 'c3', start: 4, end: 5, text: '再见！' }
+  ];
+  const ref = [
+    { id: 'r1', start: 0.2, end: 1.2, text: '你好 世界' },
+    { id: 'r3', start: 4.4, end: 5.4, text: '再见。' }
+  ];
+  const diff = buildRefDiff(cur, ref)!;
+  assert(diff.pairs.length === 2, `插入前后两句均配对（实际 ${diff.pairs.length}）`);
+  assert(
+    diff.pairs[0].current.id === 'c1' && diff.pairs[0].reference.id === 'r1',
+    '首句：空白差异不影响配对'
+  );
+  assert(
+    diff.pairs[1].current.id === 'c3' && diff.pairs[1].reference.id === 'r3',
+    '插入句之后仍对齐正确条目：标点差异不影响配对'
+  );
+  assert(diff.currentOnly.length === 1 && diff.currentOnly[0].id === 'c2', '插入句为当前独有');
+  assert(diff.referenceOnly.length === 0, '参考侧无独有');
+}
+
+// 25. 偏差阈值（严格大于、毫秒精度）与条目汇总
+{
+  const cur = [
+    { id: 'c1', start: 1, end: 2, text: 'x' },
+    { id: 'c2', start: 5, end: 6, text: 'y' },
+    { id: 'c3', start: 9, end: 10, text: 'z' }
+  ];
+  const ref = [
+    { id: 'r1', start: 1.4, end: 2.6, text: 'x' }, // Δ起 -0.4 / Δ终 -0.6
+    { id: 'r2', start: 5.1, end: 6.1, text: 'y' }, // Δ -0.1
+    { id: 'r4', start: 20, end: 21, text: 'w' }
+  ];
+  const diff = buildRefDiff(cur, ref)!;
+  assert(diff.pairs.length === 2, 'x / y 两 对配对');
+  const p1 = diff.pairs[0];
+  assert(p1.startDelta < 0 && p1.endDelta < 0, '偏差带符号：当前早于参考为负');
+  assert(pairDeviated(p1, 0.5), '终点偏差 0.6 > 0.5 超限');
+  assert(!pairDeviated(p1, 0.6), '恰好 0.6 不算超过（严格大于）');
+  assert(!pairDeviated(diff.pairs[1], 0.5), '0.1 偏差不超限');
+  const stats = summarizeRefDiff(diff, 0.5);
+  assert(stats.paired === 2 && stats.deviated === 1, `统计：2 对配对、1 对超限（实际 ${stats.paired}/${stats.deviated}）`);
+  assert(stats.currentOnly === 1 && stats.referenceOnly === 1, '统计：两轨各 1 条独有');
+  assert(stats.items.length === 3, '条目 = 1 超限 + 2 独有');
+  assert(
+    stats.items[0].kind === 'pair' &&
+      stats.items[1].kind === 'current-only' &&
+      stats.items[2].kind === 'reference-only',
+    '条目按所在侧起点时间混排'
+  );
+  assert(refItemKey(stats.items[0]).startsWith('p:'), '配对条目 key 以 p: 开头');
+  // 阈值放大后超限配对不再列出
+  assert(summarizeRefDiff(diff, 1).deviated === 0, '阈值 1s 时无超限条目');
+}
+
+// 26. 随机样本：配对单调、文本键一致、两侧条目守恒
+{
+  let seed = 42;
+  const rnd = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed / 0x7fffffff;
+  };
+  const texts = ['A', 'B', 'C', 'D'];
+  const mk = (prefix: string, count: number) => {
+    const out: Array<{ id: string; start: number; end: number; text: string }> = [];
+    let t = 0;
+    for (let i = 0; i < count; i++) {
+      t += rnd() * 2;
+      out.push({ id: `${prefix}${i}`, start: t, end: t + 0.5, text: texts[Math.floor(rnd() * texts.length)] });
+      t += 0.6;
+    }
+    return out;
+  };
+  const cur = mk('c', 60);
+  const ref = mk('r', 55);
+  const diff = buildRefDiff(cur, ref)!;
+  const curOrder = new Map(
+    [...cur].sort((a, b) => a.start - b.start || a.end - b.end).map((c, i) => [c.id, i])
+  );
+  const refOrder = new Map(
+    [...ref].sort((a, b) => a.start - b.start || a.end - b.end).map((c, i) => [c.id, i])
+  );
+  let ok = true;
+  for (let k = 1; k < diff.pairs.length; k++) {
+    const p0 = diff.pairs[k - 1];
+    const p1 = diff.pairs[k];
+    if (!(curOrder.get(p0.current.id)! < curOrder.get(p1.current.id)!)) ok = false;
+    if (!(refOrder.get(p0.reference.id)! < refOrder.get(p1.reference.id)!)) ok = false;
+  }
+  for (const p of diff.pairs) {
+    if (normalizeCueText(p.current.text) !== normalizeCueText(p.reference.text)) ok = false;
+  }
+  assert(ok, '随机样本：配对在两轨各自严格单调，且比较键相同');
+  assert(diff.pairs.length + diff.currentOnly.length === 60, '当前轨条目守恒');
+  assert(diff.pairs.length + diff.referenceOnly.length === 55, '参考轨条目守恒');
+}
+
+// 27. 空轨与规模上限
+{
+  const one = [{ id: 'a', start: 0, end: 1, text: 'x' }];
+  const emptyCur = buildRefDiff([], one)!;
+  assert(emptyCur.pairs.length === 0 && emptyCur.referenceOnly.length === 1, '当前轨为空：全部为参考独有');
+  const emptyRef = buildRefDiff(one, [])!;
+  assert(emptyRef.pairs.length === 0 && emptyRef.currentOnly.length === 1, '参考轨为空：全部为当前独有');
+  assert(MAX_PAIR_CELLS > 0, '配对矩阵单元格上限为正数');
+}
 
 process.exit(fail ? 1 : 0);

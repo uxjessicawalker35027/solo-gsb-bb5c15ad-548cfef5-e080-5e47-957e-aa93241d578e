@@ -4,6 +4,8 @@ import Timeline from './components/Timeline';
 import CueList from './components/CueList';
 import ShadowPanel from './components/ShadowPanel';
 import DriftPanel from './components/DriftPanel';
+import RefDiffPanel from './components/RefDiffPanel';
+import { buildRefDiff, summarizeRefDiff, type RefDiffItem } from './lib/refdiff';
 import type { Constraints, Cue, DriftPreview, SilenceStatus } from './types';
 import { formatClock, parseSrt, serializeSrt } from './lib/srt';
 import {
@@ -67,6 +69,8 @@ interface Toast {
 const AUTOSAVE_KEY = 'subtitle-deck.autosave';
 /** 自动保存去抖间隔（ms） */
 const SAVE_DEBOUNCE_MS = 400;
+/** 未载入参考轨时传给面板的稳定空数组（避免每次渲染新建引用） */
+const NO_CUES: Cue[] = [];
 
 function loadAutoSavePref(): boolean {
   try {
@@ -125,6 +129,12 @@ export default function App() {
   const [driftInputs, setDriftInputs] = useState<{ start: string; end: string } | null>(null);
   // 强制列表 / 时间轴重新滚动到选中字幕的信号（定位冲突时选中项可能未变）
   const [focusNonce, setFocusNonce] = useState(0);
+
+  // 参考字幕差异审阅：参考轨与审阅状态仅存于当前页面内存，
+  // 不进入会话快照 / localStorage；切换当前 SRT 或恢复会话时清空
+  const [refTrack, setRefTrack] = useState<{ name: string; cues: Cue[] } | null>(null);
+  // 已配对条目起止偏差的审阅阈值（秒）：起点或终点偏差严格大于即列出
+  const [refThreshold, setRefThreshold] = useState(0.5);
 
   /* ---------------- 本地会话恢复 / 自动保存 ---------------- */
   // 当前工作区绑定的会话 id：导入 SRT 时新建；恢复会话时沿用；空白工作区为 null
@@ -579,6 +589,19 @@ export default function App() {
     clearDrift();
   }, [driftPlan, commit, pushToast, clearDrift]);
 
+  /* ---------------- 参考字幕差异审阅 ---------------- */
+
+  // 配对仅依赖两轨字幕：校对中的时间码调整会实时反映到偏差，编辑文本也会重新配对
+  const refDiff = useMemo(
+    () => (refTrack ? buildRefDiff(cues, refTrack.cues) : null),
+    [cues, refTrack]
+  );
+  // 阈值变化只重算分类，不重复配对
+  const refStats = useMemo(
+    () => (refDiff ? summarizeRefDiff(refDiff, refThreshold) : null),
+    [refDiff, refThreshold]
+  );
+
   /* ---------------- SRT ---------------- */
 
   const handleImportSrt = useCallback(
@@ -591,6 +614,7 @@ export default function App() {
           return;
         }
         clearDrift(); // 切换字幕文件：清空区间漂移预览
+        setRefTrack(null); // 切换当前 SRT：参考轨与审阅状态仅跟随当前页面的这份字幕
         // 新 SRT = 新会话：重置修订号 / 创建时间，并丢弃上一文件的音频与等待态
         if (audioUrlRef.current) {
           URL.revokeObjectURL(audioUrlRef.current);
@@ -626,6 +650,66 @@ export default function App() {
       reader.readAsText(file, 'utf-8');
     },
     [pushToast, clearDrift]
+  );
+
+  /**
+   * 导入参考 SRT：只装载到审阅参考轨，绝不触碰当前字幕 / 历史 / 音频 / 会话。
+   * 导入前做规模预检（配对矩阵有单元格上限），避免超大文件占用过多内存。
+   */
+  const handleImportRefSrt = useCallback(
+    (file: File) => {
+      if (cues.length === 0) {
+        pushToast('warn', '请先导入正在校对的 SRT，再导入参考字幕');
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = parseSrt(String(reader.result ?? ''));
+        if (result.cues.length === 0) {
+          pushToast('error', '参考文件未解析出任何有效字幕');
+          return;
+        }
+        if (buildRefDiff(cues, result.cues) === null) {
+          pushToast(
+            'error',
+            `两轨规模过大（当前 ${cues.length} 条 × 参考 ${result.cues.length} 条），无法进行单调配对`
+          );
+          return;
+        }
+        setRefTrack({ name: file.name, cues: result.cues });
+        pushToast('info', `已载入参考字幕 ${result.cues.length} 条：${file.name}（不替换当前校对内容）`);
+        result.warnings.forEach((w) => pushToast('warn', w));
+      };
+      reader.onerror = () => pushToast('error', `读取文件失败：${file.name}`);
+      reader.readAsText(file, 'utf-8');
+    },
+    [cues, pushToast]
+  );
+
+  /** 清空参考轨与审阅状态（当前校对内容、会话与音频均不受影响） */
+  const handleClearRef = useCallback(() => {
+    setRefTrack(null);
+    pushToast('info', '已清空参考轨');
+  }, [pushToast]);
+
+  /**
+   * 点击差异条目定位时间轴：
+   * - 当前侧有对应字幕（偏差超限 / 当前独有）：选中该字幕、滚动列表与时间轴并移动播放头；
+   * - 参考独有（当前轨无对应条目）：仅把播放头移到参考条目起点。
+   * 直接 setSelectedId 而不走 handleSelectCue，以保留进行中的漂移区间（与冲突定位一致）。
+   */
+  const handleRefLocate = useCallback(
+    (item: RefDiffItem) => {
+      if (item.kind === 'reference-only') {
+        seek(item.cue.start);
+        return;
+      }
+      const cue = item.kind === 'pair' ? item.pair.current : item.cue;
+      setSelectedId(cue.id);
+      setFocusNonce((n) => n + 1);
+      seek(cue.start);
+    },
+    [seek]
   );
 
   /* ---------------- 历史：快捷键 ---------------- */
@@ -928,6 +1012,7 @@ export default function App() {
       setDriftAnchorId(null);
       setDriftEndId(null);
       setDriftInputs(null);
+      setRefTrack(null); // 恢复会话整体替换当前字幕：参考轨不跨工作区保留
       setCurrentTime(0);
       setDuration(0);
       setIsPlaying(false);
@@ -1007,6 +1092,11 @@ export default function App() {
       parts.push(`区间漂移待输入目标锚点（${driftRangeInfo.count} 条）`);
     }
     if (cues.length > 0) parts.push(`已记录 ${history.past.length} 次调整`);
+    if (refTrack && refStats) {
+      parts.push(
+        `参考轨 ${refTrack.cues.length} 条 · 配对 ${refStats.paired} · 偏差超限 ${refStats.deviated} · 独有 ${refStats.currentOnly}+${refStats.referenceOnly}`
+      );
+    }
     if (audioPending) parts.push('等待重新选择音频（播放已停用，编辑/导出不受影响）');
     if (sessionId) {
       if (!autoSave) parts.push('自动保存已停用');
@@ -1031,7 +1121,9 @@ export default function App() {
     audioPending,
     sessionId,
     autoSave,
-    saveStatus
+    saveStatus,
+    refTrack,
+    refStats
   ]);
 
   return (
@@ -1157,6 +1249,18 @@ export default function App() {
             duration={duration}
             onNotice={(text) => pushToast('warn', text)}
             onBusyChange={handleShadowBusyChange}
+          />
+          <RefDiffPanel
+            refName={refTrack?.name ?? null}
+            refCount={refTrack?.cues.length ?? 0}
+            currentCues={cues}
+            refCues={refTrack?.cues ?? NO_CUES}
+            stats={refStats}
+            threshold={refThreshold}
+            onThresholdChange={setRefThreshold}
+            onImport={handleImportRefSrt}
+            onClear={handleClearRef}
+            onLocate={handleRefLocate}
           />
         </section>
         <CueList
