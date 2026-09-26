@@ -30,6 +30,7 @@ import {
   undoHistory
 } from './lib/cues';
 import { detectSilences, type WindowLevels } from './lib/silence';
+import { computeRefDiff, pairDeviationExceeds, type RefDiffComputation } from './lib/refDiff';
 import {
   AbortToken,
   analyzeAudioFile,
@@ -56,6 +57,7 @@ import {
   SessionStorageError
 } from './lib/sessionDb';
 import RecoveryDialog from './components/RecoveryDialog';
+import RefDiffPanel from './components/RefDiffPanel';
 
 interface Toast {
   id: number;
@@ -125,6 +127,13 @@ export default function App() {
   const [driftInputs, setDriftInputs] = useState<{ start: string; end: string } | null>(null);
   // 强制列表 / 时间轴重新滚动到选中字幕的信号（定位冲突时选中项可能未变）
   const [focusNonce, setFocusNonce] = useState(0);
+
+  /* ---------------- 参考字幕差异审阅 ---------------- */
+  // 参考轨：在当前工作区之外导入，不替换正在校对的字幕；仅保留在当前页面内存，
+  // 不写入 IndexedDB 会话快照（刷新即消失）；切换当前 SRT / 恢复会话时清空
+  const [refTrack, setRefTrack] = useState<{ name: string; cues: Cue[] } | null>(null);
+  // 起止偏差可调阈值（秒）：已配对条目 |Δ起点| 或 |Δ终点| 严格超过即列出
+  const [refThreshold, setRefThreshold] = useState(0.5);
 
   /* ---------------- 本地会话恢复 / 自动保存 ---------------- */
   // 当前工作区绑定的会话 id：导入 SRT 时新建；恢复会话时沿用；空白工作区为 null
@@ -579,6 +588,54 @@ export default function App() {
     clearDrift();
   }, [driftPlan, commit, pushToast, clearDrift]);
 
+  /* ---------------- 参考字幕差异审阅 ---------------- */
+
+  // 一对一单调配对结果：当前字幕（含撤销/重做后的每一次调整）或参考轨变化时重算；
+  // null 表示规模超限放弃计算
+  const refDiff = useMemo<RefDiffComputation<Cue> | null>(
+    () => (refTrack ? computeRefDiff(cues, refTrack.cues) : null),
+    [cues, refTrack]
+  );
+  const refTooLarge = refTrack !== null && refDiff === null;
+
+  /** 导入参考 SRT：只进参考轨，不触碰当前工作区字幕与历史 */
+  const handleImportRefSrt = useCallback(
+    (file: File) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = parseSrt(String(reader.result ?? ''));
+        if (result.cues.length === 0) {
+          pushToast('error', `参考文件未解析出任何有效字幕：${file.name}`);
+          return;
+        }
+        setRefTrack({ name: file.name, cues: result.cues });
+        pushToast('info', `已导入参考字幕 ${result.cues.length} 条：${file.name}（不影响当前校对，仅保留在当前页面）`);
+        result.warnings.forEach((w) => pushToast('warn', w));
+      };
+      reader.onerror = () => pushToast('error', `读取参考文件失败：${file.name}`);
+      reader.readAsText(file, 'utf-8');
+    },
+    [pushToast]
+  );
+
+  /** 清除参考轨与审阅结果（当前字幕不受影响） */
+  const clearRefTrack = useCallback(() => {
+    setRefTrack(null);
+  }, []);
+
+  /** 点击差异结果行：定位时间轴；当前轨条目同步选中并滚动到可视区 */
+  const handleRefLocate = useCallback(
+    (time: number, cueId: string | null) => {
+      if (cueId) {
+        // 直接 setSelectedId（不动漂移锚点与区间），并强制列表/时间轴重新滚动
+        setSelectedId(cueId);
+        setFocusNonce((n) => n + 1);
+      }
+      seekAndPlay(time);
+    },
+    [seekAndPlay]
+  );
+
   /* ---------------- SRT ---------------- */
 
   const handleImportSrt = useCallback(
@@ -591,6 +648,7 @@ export default function App() {
           return;
         }
         clearDrift(); // 切换字幕文件：清空区间漂移预览
+        setRefTrack(null); // 切换当前 SRT：清空参考轨与差异审阅结果
         // 新 SRT = 新会话：重置修订号 / 创建时间，并丢弃上一文件的音频与等待态
         if (audioUrlRef.current) {
           URL.revokeObjectURL(audioUrlRef.current);
@@ -928,6 +986,7 @@ export default function App() {
       setDriftAnchorId(null);
       setDriftEndId(null);
       setDriftInputs(null);
+      setRefTrack(null); // 恢复会话 = 切换当前字幕内容：清空参考轨与差异审阅结果
       setCurrentTime(0);
       setDuration(0);
       setIsPlaying(false);
@@ -1007,6 +1066,14 @@ export default function App() {
       parts.push(`区间漂移待输入目标锚点（${driftRangeInfo.count} 条）`);
     }
     if (cues.length > 0) parts.push(`已记录 ${history.past.length} 次调整`);
+    if (refTrack && refDiff) {
+      const devCount = refDiff.pairs.filter((p) => pairDeviationExceeds(p, refThreshold)).length;
+      parts.push(
+        `参考差异：配对 ${refDiff.pairs.length} · 偏差 ${devCount} · 独有 ${refDiff.currentOnly.length}+${refDiff.refOnly.length}`
+      );
+    } else if (refTooLarge) {
+      parts.push('参考字幕规模超限，无法配对');
+    }
     if (audioPending) parts.push('等待重新选择音频（播放已停用，编辑/导出不受影响）');
     if (sessionId) {
       if (!autoSave) parts.push('自动保存已停用');
@@ -1031,7 +1098,11 @@ export default function App() {
     audioPending,
     sessionId,
     autoSave,
-    saveStatus
+    saveStatus,
+    refTrack,
+    refDiff,
+    refTooLarge,
+    refThreshold
   ]);
 
   return (
@@ -1151,6 +1222,17 @@ export default function App() {
               onLocateConflict={locateDriftConflict}
             />
           )}
+          <RefDiffPanel
+            refName={refTrack?.name ?? null}
+            refCount={refTrack?.cues.length ?? 0}
+            tooLarge={refTooLarge}
+            diff={refDiff}
+            threshold={refThreshold}
+            onImport={handleImportRefSrt}
+            onClear={clearRefTrack}
+            onThresholdChange={setRefThreshold}
+            onLocate={handleRefLocate}
+          />
           <ShadowPanel
             cue={selectedCue}
             audioUrl={audioObjectUrl}

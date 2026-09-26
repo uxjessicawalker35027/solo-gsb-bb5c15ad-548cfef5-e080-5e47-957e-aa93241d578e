@@ -37,6 +37,12 @@ import {
 } from '../src/lib/drift';
 import { sha256Bytes } from '../src/lib/sha256';
 import {
+  computeRefDiff,
+  MAX_DIFF_CELLS,
+  normalizeCueText,
+  pairDeviationExceeds
+} from '../src/lib/refDiff';
+import {
   matchAudioFingerprint,
   SESSION_SCHEMA_VERSION,
   validateSession
@@ -558,5 +564,159 @@ badSelected.view = { ...(badSelected.view as object), selectedId: 'ghost' };
 assert(validateSession(badSelected).ok === false, '选中字幕不属于会话拒绝');
 const nullAudio = makeValidSession({ audio: null });
 assert(validateSession(nullAudio).ok, '无音频指纹的会话合法');
+
+/* ---------------- 参考字幕差异审阅：归一化 / 单调配对 / 差异分类 ---------------- */
+
+// 22. 文本归一化：去空白、标点与符号，全角归一，小写化
+{
+  assert(normalizeCueText('  Hello,  World! ') === 'helloworld', '归一化去空白与英文标点并小写化');
+  assert(normalizeCueText('你好，世界！') === '你好世界', '归一化去中文标点');
+  assert(normalizeCueText('♪ 啦啦\n啦 ♪') === '啦啦啦', '归一化去换行与歌词符号');
+  assert(normalizeCueText('Ｆｉｇｈｔ！') === 'fight', 'NFKC 全角转半角');
+  assert(normalizeCueText('，。！…') === '', '全标点归一化为空串');
+}
+
+// 23. 基本配对与差异分类：文本相同（归一化后）才配对
+{
+  const cur = [
+    { start: 1, end: 2, text: '你好' },
+    { start: 3, end: 4, text: '世界' },
+    { start: 5, end: 6, text: '当前独有' }
+  ];
+  const ref = [
+    { start: 1.2, end: 2.1, text: '你好！' },
+    { start: 3.1, end: 4.2, text: '世 界' },
+    { start: 7, end: 8, text: '参考独有' }
+  ];
+  const d = computeRefDiff(cur, ref);
+  assert(d !== null && d.pairs.length === 2, `配对标点/空白差异的 2 对（实际 ${d?.pairs.length}）`);
+  assert(
+    d !== null && d.currentOnly.length === 1 && d.currentOnly[0] === 2,
+    '当前独有为第 3 条'
+  );
+  assert(
+    d !== null && d.refOnly.length === 1 && d.refOnly[0] === 2,
+    '参考独有为第 3 条'
+  );
+  assert(
+    d !== null && Math.abs(d.pairs[0].startDelta - -0.2) < 1e-9 && Math.abs(d.pairs[0].endDelta - -0.1) < 1e-9,
+    `起点/终点偏差带符号（实际 Δ起 ${d?.pairs[0].startDelta}）`
+  );
+  // 输入乱序也能配对（内部按时间排序）
+  const shuffled = computeRefDiff([cur[2], cur[0], cur[1]], [ref[1], ref[2], ref[0]]);
+  assert(shuffled !== null && shuffled.pairs.length === 2, '乱序输入内部排序后结果一致');
+  assert(
+    shuffled !== null && shuffled.current[0].start === 1 && shuffled.reference[0].start === 1.2,
+    '返回轨道为时间序'
+  );
+}
+
+// 24. 重复台词：单调保序 + 同配对数下选时间差最小
+{
+  const cur = [
+    { start: 10, end: 11, text: '一样' },
+    { start: 20, end: 21, text: '一样' }
+  ];
+  const ref = [
+    { start: 10.1, end: 11, text: '一样' },
+    { start: 19.8, end: 21, text: '一样' }
+  ];
+  const d = computeRefDiff(cur, ref);
+  assert(
+    d !== null && d.pairs.length === 2 && d.pairs[0].cur === 0 && d.pairs[0].ref === 0 &&
+      d.pairs[1].cur === 1 && d.pairs[1].ref === 1,
+    '重复台词按时间序一一对应，不交叉'
+  );
+  // 参考轨只有一条「一样」：应配时间更近的当前条目（cur[1] @20 距 ref @19.8 为 0.2）
+  const d2 = computeRefDiff(cur, [{ start: 19.8, end: 21, text: '一样' }]);
+  assert(
+    d2 !== null && d2.pairs.length === 1 && d2.pairs[0].cur === 1 && d2.pairs[0].ref === 0,
+    '单侧重复时配时间差最小者'
+  );
+  assert(d2 !== null && d2.currentOnly.length === 1 && d2.currentOnly[0] === 0, '另一条计入当前独有');
+}
+
+// 25. 单侧插入不错位：插入条目后后续台词仍正确配对
+{
+  const cur = [
+    { start: 1, end: 1.5, text: '甲' },
+    { start: 2, end: 2.5, text: '乙' },
+    { start: 3, end: 3.5, text: '丙' },
+    { start: 4, end: 4.5, text: '丁' }
+  ];
+  const ref = [
+    { start: 1, end: 1.5, text: '甲' },
+    { start: 1.6, end: 1.9, text: '插入的旁白' },
+    { start: 2, end: 2.5, text: '乙' },
+    { start: 3, end: 3.5, text: '丙' },
+    { start: 4, end: 4.5, text: '丁' }
+  ];
+  const d = computeRefDiff(cur, ref);
+  assert(
+    d !== null && d.pairs.length === 4 && d.refOnly.length === 1 && d.refOnly[0] === 1,
+    `单侧插入后 4 对全部正确配对（实际 ${d?.pairs.length} 对）`
+  );
+  assert(
+    d !== null && d.pairs.every((p, i) => p.cur === i && p.ref === (i === 0 ? 0 : i + 1)),
+    '插入点之后不错位'
+  );
+}
+
+// 26. 最大化配对数优先于时间差；文本不同 / 空归一化不配对
+{
+  // 顺序颠倒的相同文本：单调约束下最多配 1 对
+  const d = computeRefDiff(
+    [
+      { start: 0, end: 1, text: 'A' },
+      { start: 1, end: 2, text: 'B' }
+    ],
+    [
+      { start: 0, end: 1, text: 'B' },
+      { start: 1, end: 2, text: 'A' }
+    ]
+  );
+  assert(d !== null && d.pairs.length === 1, `逆序重复最多配 1 对（实际 ${d?.pairs.length}）`);
+  // 文本不同不配对
+  const d2 = computeRefDiff(
+    [{ start: 0, end: 1, text: '完全不同' }],
+    [{ start: 0, end: 1, text: '毫无关系' }]
+  );
+  assert(
+    d2 !== null && d2.pairs.length === 0 && d2.currentOnly.length === 1 && d2.refOnly.length === 1,
+    '文本不同不配对，各自独有'
+  );
+  // 归一化为空的条目不参与配对（即使两侧都为空文本）
+  const d3 = computeRefDiff(
+    [{ start: 0, end: 1, text: '！！！' }],
+    [{ start: 0, end: 1, text: '？？？' }]
+  );
+  assert(
+    d3 !== null && d3.pairs.length === 0 && d3.currentOnly.length === 1 && d3.refOnly.length === 1,
+    '空归一化文本不配对'
+  );
+  // 空轨：另一侧全部独有
+  const d4 = computeRefDiff([], [{ start: 0, end: 1, text: 'x' }]);
+  assert(d4 !== null && d4.refOnly.length === 1 && d4.pairs.length === 0, '空当前轨：参考全部独有');
+}
+
+// 27. 偏差阈值判定：严格大于（恰好等于不算），负阈值按 0 计
+{
+  const pair = { cur: 0, ref: 0, startDelta: 0.5, endDelta: -0.3 };
+  assert(!pairDeviationExceeds(pair, 0.5), '偏差恰好等于阈值不算超');
+  assert(pairDeviationExceeds(pair, 0.499), '偏差严格超过阈值');
+  assert(pairDeviationExceeds(pair, 0), '阈值 0 时任何偏差都列出');
+  assert(pairDeviationExceeds(pair, -1), '负阈值按 0 计：非零偏差仍列出');
+  assert(!pairDeviationExceeds({ ...pair, startDelta: 0, endDelta: 0 }, -1), '负阈值按 0 计：零偏差不列出');
+  assert(!pairDeviationExceeds({ ...pair, startDelta: 0, endDelta: 0 }, 0), '零偏差不列出');
+}
+
+// 28. 规模上限：超出单元格上限返回 null 而不是卡死
+{
+  assert(MAX_DIFF_CELLS > 0, '配对规模上限为正值');
+  const big = Array.from({ length: 7000 }, (_, i) => ({ start: i * 2, end: i * 2 + 1, text: `t${i}` }));
+  assert(computeRefDiff(big, big) === null, '7000×7000 超上限返回 null');
+  const ok = computeRefDiff(big.slice(0, 100), big.slice(0, 100));
+  assert(ok !== null && ok.pairs.length === 100, '规模内正常配对');
+}
 
 process.exit(fail ? 1 : 0);
